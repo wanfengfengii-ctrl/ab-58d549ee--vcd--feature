@@ -1,0 +1,38 @@
+services:
+  web:
+    build: .
+    image: vcd-window-service:latest
+    ports:
+      # Host-side port is configurable: VCD_PORT=9090 docker compose up web
+      - "${VCD_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status == 200 else 1)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 3s
+
+  # One-shot verification job: starts only after the API health check is
+  # ready, then runs unit tests, a build check and HTTP smoke tests.
+  # Its container exit code reports the overall result:
+  #   docker compose up --build verify
+  verify:
+    image: vcd-window-service:latest
+    build: .
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      VCD_BASE_URL: http://web:8080
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "==> unit tests"
+        python -m pytest -q
+        echo "==> build check (byte-compile + dependency consistency)"
+        python -m compileall -q app scripts
+        pip check
+        echo "==> HTTP smoke tests (same-instant changes + cross-timescale window)"
+        python scripts/smoke_test.py
+    restart: "no"
