@@ -7,6 +7,8 @@ It exercises:
 * same-timestamp value changes arbitrated in text order
 * a cross-timescale window (1ns vs 1ps must give identical fs timelines)
 * a time-regression rejection with a locatable error (no partial result)
+* golden/candidate comparison over POST /api/vcd/compare, including a
+  cross-timescale match, real level divergence and side-tagged failures
 
 Exits 0 only when every check passes.
 """
@@ -44,6 +46,24 @@ def post(body: str, signals, start: int, end: int) -> requests.Response:
         data=data,
         timeout=TIMEOUT,
     )
+
+
+def post_compare(ref_body: str, cand_body: str, pairs, start: int, end: int):
+    files = {
+        "reference": ("ref.vcd", io.BytesIO(ref_body.encode("ascii")), "text/plain"),
+        "candidate": ("cand.vcd", io.BytesIO(cand_body.encode("ascii")), "text/plain"),
+    }
+    data = {
+        "window": json.dumps({"start": start, "end": end}),
+        "pairs": json.dumps(pairs),
+    }
+    resp = requests.post(
+        f"{BASE_URL}/api/vcd/compare",
+        files=files,
+        data=data,
+        timeout=TIMEOUT,
+    )
+    return resp
 
 
 failures: list[str] = []
@@ -126,6 +146,94 @@ def main() -> int:
           r5.status_code == 422 and err5.get("code") == "WINDOW_NOT_COVERED"
           and "signals" not in r5.json(),
           f"status={r5.status_code} body={r5.text[:200]}")
+
+    # 7. compare: cross-timescale logically equivalent waveforms agree
+    ref_ns = HEADER.format(ts="1ns") + (
+        "#0\n0!\n0\"\n#10\n1!\n1\"\n#20\n0!\n0\"\n"
+    )
+    cand_ps = HEADER.format(ts="1ps") + (
+        "#0\n0!\n0\"\n#10000\n1!\n1\"\n#20000\n0!\n0\"\n"
+    )
+    pairs = [
+        {"index": 0, "reference": "top.clk", "candidate": "top.clk"},
+        {"index": 1, "reference": "top.rst", "candidate": "top.rst"},
+    ]
+    rc = post_compare(ref_ns, cand_ps, pairs, 0, 20_000_000)
+    ok_c = (
+        rc.status_code == 200
+        and [p["index"] for p in rc.json()["pairs"]] == [0, 1]
+        and all(p["mismatches"] == [] and p["totalMismatchFs"] == 0
+                for p in rc.json()["pairs"])
+    )
+    check("compare: cross-timescale equivalent waveforms match", ok_c,
+          f"status={rc.status_code} body={rc.text[:200]}")
+
+    # 8. compare: real level divergence is bounded to its actual duration;
+    #    mismatch intervals are half-open and carry both levels.
+    #    golden clk : 0[0,10) 1[10,20) ; golden rst: 0[0,10) 1[10,20)
+    #    cand   clk : 0[0,5) 1[5,15) 0[15,20)
+    #    cand   rst : 0[0,10) 1[10,15) 0[15,20)
+    divergent = HEADER.format(ts="1ns") + (
+        "#0\n0!\n0\"\n#5\n1!\n#10\n1\"\n#15\n0!\n0\"\n#20\n0!\n0\"\n"
+    )
+    rd = post_compare(ref_ns, divergent, pairs, 0, 20_000_000)
+    d_body = rd.json() if rd.content else {}
+    d_pairs = d_body.get("pairs") or []
+    d_clk = d_pairs[0]["mismatches"] if len(d_pairs) > 0 else None
+    d_rst = d_pairs[1]["mismatches"] if len(d_pairs) > 1 else None
+    expected_clk = [
+        {"start": 5_000_000, "end": 10_000_000, "reference": "0",
+         "candidate": "1", "mismatchFs": 5_000_000},
+        {"start": 15_000_000, "end": 20_000_000, "reference": "1",
+         "candidate": "0", "mismatchFs": 5_000_000},
+    ]
+    expected_rst = [
+        {"start": 15_000_000, "end": 20_000_000, "reference": "1",
+         "candidate": "0", "mismatchFs": 5_000_000},
+    ]
+    check("compare: mismatches bounded to actual differing half-open intervals",
+          rd.status_code == 200 and d_clk == expected_clk and d_rst == expected_rst
+          and d_pairs[0]["totalMismatchFs"] == 10_000_000,
+          f"status={rd.status_code} body={rd.text[:240]}")
+
+    # 9. compare: divergent changes exactly at window end count for nothing
+    same_to_end = HEADER.format(ts="1ns") + (
+        "#0\n0!\n#10\n1!\n#20\n0!\n#30\n1!\n"
+    )
+    re_ = post_compare(same_to_end, same_to_end,
+                       [pairs[0]], 0, 20_000_000)
+    check("compare: identical window reports zero duration and no diffs",
+          re_.status_code == 200
+          and re_.json()["pairs"][0]["mismatches"] == []
+          and re_.json()["pairs"][0]["totalMismatchFs"] == 0,
+          f"status={re_.status_code} body={re_.text[:200]}")
+
+    # 10. compare: failures are side-tagged and carry no partial results
+    bad_cand = HEADER.format(ts="1ns") + "#0\n0!\n#10\n1!\n#5\n0!\n"
+    rx = post_compare(ref_ns, bad_cand, pairs, 0, 20_000_000)
+    ex = rx.json().get("error", {}) if rx.content else {}
+    check("compare: candidate parse error tagged candidate, no partial results",
+          rx.status_code == 422 and ex.get("code") == "TIME_REGRESSION"
+          and ex.get("side") == "candidate" and "pairs" not in rx.json(),
+          f"status={rx.status_code} body={rx.text[:200]}")
+
+    dup_pairs = pairs + [
+        {"index": 0, "reference": "top.clk", "candidate": "top.clk"}
+    ]
+    ry = post_compare(ref_ns, cand_ps, dup_pairs, 0, 20_000_000)
+    ey = ry.json().get("error", {}) if ry.content else {}
+    check("compare: duplicate pair index rejected as comparison error",
+          ry.status_code == 400 and ey.get("code") == "DUPLICATE_PAIR"
+          and ey.get("side") == "comparison",
+          f"status={ry.status_code} body={ry.text[:200]}")
+
+    missing = [{"index": 0, "reference": "top.clk", "candidate": "top.ghost"}]
+    rz = post_compare(ref_ns, cand_ps, missing, 0, 20_000_000)
+    ez = rz.json().get("error", {}) if rz.content else {}
+    check("compare: missing candidate signal tagged candidate",
+          rz.status_code == 400 and ez.get("code") == "UNDECLARED_SIGNAL"
+          and ez.get("side") == "candidate",
+          f"status={rz.status_code} body={rz.text[:200]}")
 
     if failures:
         print(f"\n{len(failures)} smoke check(s) failed: {failures}")

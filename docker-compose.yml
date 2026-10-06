@@ -33,6 +33,6 @@ services:
         echo "==> build check (byte-compile + dependency consistency)"
         python -m compileall -q app scripts
         pip check
-        echo "==> HTTP smoke tests (same-instant changes + cross-timescale window)"
+        echo "==> HTTP smoke tests (window extraction + dual-file compare)"
         python scripts/smoke_test.py
     restart: "no"
