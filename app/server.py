@@ -10,8 +10,12 @@ from flask import Flask, jsonify, request
 
 from .vcd import (
     MAX_FILE_BYTES,
+    SOURCE_CANDIDATE,
+    SOURCE_REFERENCE,
     VCDError,
     bad_request,
+    compare,
+    parse_pairs,
     parse_signals,
     parse_window,
     process,
@@ -20,12 +24,24 @@ from .vcd import (
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    # 4 MiB file limit plus headroom for the multipart envelope; the file
-    # part itself is checked precisely against MAX_FILE_BYTES.
-    app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_BYTES + 1024 * 1024
+    # Each uploaded VCD is capped precisely at 4 MiB on the decoded part
+    # below. /api/vcd/compare accepts two files, so allow two 4 MiB parts
+    # plus headroom for the multipart envelope.
+    app.config["MAX_CONTENT_LENGTH"] = 2 * MAX_FILE_BYTES + 2 * 1024 * 1024
 
     @app.errorhandler(413)
     def too_large(_err: Exception) -> tuple:
+        if request.path == "/api/vcd/compare":
+            # Attribute envelope-level rejections for compare.
+            return jsonify(
+                {
+                    "error": {
+                        "code": "FILE_TOO_LARGE",
+                        "message": "upload exceeds the 4 MiB per-file limit",
+                        "source": "comparison",
+                    }
+                }
+            ), 413
         return (
             jsonify(
                 {
@@ -49,6 +65,43 @@ def create_app() -> Flask:
         except VCDError as exc:
             body, status = exc.to_response()
             return jsonify(body), status
+
+    @app.post("/api/vcd/compare")
+    def vcd_compare() -> tuple:
+        try:
+            return _handle_compare()
+        except VCDError as exc:
+            body, status = exc.to_response()
+            # The compare contract attributes every failure to one side.
+            body["error"]["source"] = exc.source
+            return jsonify(body), status
+
+    def _read_upload(field: str, source: str) -> str:
+        if field not in request.files:
+            raise bad_request(
+                "MISSING_FIELD",
+                f"multipart field {field!r} is required",
+                source=source,
+            )
+        upload = request.files[field]
+        raw = upload.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            raise VCDError(
+                "FILE_TOO_LARGE",
+                f"uploaded VCD exceeds {MAX_FILE_BYTES} bytes (4 MiB)",
+                http_status=413,
+                source=source,
+            )
+        try:
+            return raw.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise VCDError(
+                "NOT_ASCII",
+                "the VCD file must be ASCII encoded",
+                details={"byte_offset": exc.start},
+                http_status=400,
+                source=source,
+            ) from exc
 
     def _handle_window() -> tuple:
         # Note: request.content_length includes the multipart envelope, so
@@ -76,6 +129,17 @@ def create_app() -> Flask:
         signals = parse_signals(request.form.getlist("signals"))
 
         result = process(text, signals, window)
+        return jsonify(result), 200
+
+    def _handle_compare() -> tuple:
+        # Request-level problems (window, pairs, limits) are attributed to
+        # "comparison"; per-file parse problems are re-sourced below.
+        window = parse_window(_form_value("window"))
+        pairs = parse_pairs(request.form.getlist("pair"))
+        reference_text = _read_upload("reference", SOURCE_REFERENCE)
+        candidate_text = _read_upload("candidate", SOURCE_CANDIDATE)
+
+        result = compare(reference_text, candidate_text, pairs, window)
         return jsonify(result), 200
 
     def _form_value(key: str) -> Optional[str]:

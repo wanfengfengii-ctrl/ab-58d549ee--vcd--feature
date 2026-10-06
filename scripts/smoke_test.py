@@ -7,6 +7,8 @@ It exercises:
 * same-timestamp value changes arbitrated in text order
 * a cross-timescale window (1ns vs 1ps must give identical fs timelines)
 * a time-regression rejection with a locatable error (no partial result)
+* double-file golden-vs-candidate comparison via POST /api/vcd/compare:
+  cross-timescale equivalence, real level divergence and side attribution
 
 Exits 0 only when every check passes.
 """
@@ -40,6 +42,26 @@ def post(body: str, signals, start: int, end: int) -> requests.Response:
     }
     return requests.post(
         f"{BASE_URL}/api/vcd/window",
+        files=files,
+        data=data,
+        timeout=TIMEOUT,
+    )
+
+
+def post_compare(reference: str, candidate: str, pairs,
+                 start: int = 0, end: int = 20_000_000) -> requests.Response:
+    files = {
+        "reference": ("reference.vcd",
+                      io.BytesIO(reference.encode("ascii")), "text/plain"),
+        "candidate": ("candidate.vcd",
+                      io.BytesIO(candidate.encode("ascii")), "text/plain"),
+    }
+    data = {
+        "window": json.dumps({"start": start, "end": end}),
+        "pair": [json.dumps(p) for p in pairs],
+    }
+    return requests.post(
+        f"{BASE_URL}/api/vcd/compare",
         files=files,
         data=data,
         timeout=TIMEOUT,
@@ -126,6 +148,91 @@ def main() -> int:
           r5.status_code == 422 and err5.get("code") == "WINDOW_NOT_COVERED"
           and "signals" not in r5.json(),
           f"status={r5.status_code} body={r5.text[:200]}")
+
+    # 7. compare: cross-timescale logically equivalent waveforms agree
+    pair_clk = [{"reference": "top.clk", "candidate": "top.clk"}]
+    r6 = post_compare(same_time_ns, same_time_ps, pair_clk)
+    body6 = r6.json() if r6.ok else {}
+    pair6 = (body6.get("pairs") or [{}])[0]
+    check("compare: cross-timescale equivalent waveforms match",
+          r6.status_code == 200 and pair6.get("differences") == []
+          and pair6.get("mismatchFs") == 0 and body6.get("mismatchFs") == 0,
+          f"status={r6.status_code} body={r6.text[:200]}")
+
+    # 8. compare: a real level divergence lands only on the diverging interval
+    reference_ns = HEADER.format(ts="1ns") + (
+        "#0\n0!\n"
+        "#10\n1!\n"
+        "#15\n0!\n"
+        "#20\n0!\n"
+    )
+    candidate_ps = HEADER.format(ts="1ps") + (
+        "#0\n0!\n"
+        "#10000\n1!\n"
+        "#17000\n0!\n"
+        "#20000\n0!\n"
+    )
+    r7 = post_compare(reference_ns, candidate_ps, pair_clk)
+    body7 = r7.json() if r7.ok else {}
+    pair7 = (body7.get("pairs") or [{}])[0]
+    expected_diff = [{
+        "start": 15_000_000,
+        "end": 17_000_000,
+        "referenceValue": "0",
+        "candidateValue": "1",
+    }]
+    check("compare: divergence restricted to the actual half-open interval",
+          r7.status_code == 200 and pair7.get("differences") == expected_diff
+          and pair7.get("mismatchFs") == 2_000_000
+          and body7.get("mismatchFs") == 2_000_000,
+          f"status={r7.status_code} got={pair7.get('differences')}")
+
+    # 9. compare: adjacent same-kind divergences merge (candidate holds 1
+    # across a reference interior boundary at 15ns)
+    candidate_merge = HEADER.format(ts="1ps") + (
+        "#0\n0!\n"
+        "#10000\n1!\n"
+        "#20000\n0!\n"
+    )
+    r8 = post_compare(reference_ns, candidate_merge, pair_clk)
+    body8 = r8.json() if r8.ok else {}
+    pair8 = (body8.get("pairs") or [{}])[0]
+    expected_merge = [{
+        "start": 15_000_000,
+        "end": 20_000_000,
+        "referenceValue": "0",
+        "candidateValue": "1",
+    }]
+    check("compare: adjacent same-kind differences are merged",
+          r8.status_code == 200 and pair8.get("differences") == expected_merge,
+          f"status={r8.status_code} got={pair8.get('differences')}")
+
+    # 10. compare: missing candidate signal is attributed to "candidate",
+    #     with no partial result
+    r9 = post_compare(reference_ns, candidate_ps,
+                      [{"reference": "top.clk", "candidate": "top.absent"}])
+    err9 = r9.json().get("error", {}) if r9.content else {}
+    check("compare: undeclared candidate signal attributed to candidate",
+          r9.status_code == 400 and err9.get("code") == "UNDECLARED_SIGNAL"
+          and err9.get("source") == "candidate" and "pairs" not in r9.json(),
+          f"status={r9.status_code} body={r9.text[:200]}")
+
+    # 11. compare: duplicate pairs are a comparison-level failure
+    r10 = post_compare(reference_ns, candidate_ps, pair_clk + pair_clk)
+    err10 = r10.json().get("error", {}) if r10.content else {}
+    check("compare: duplicate pair rejected as a comparison error",
+          r10.status_code == 400 and err10.get("code") == "DUPLICATE_PAIR"
+          and err10.get("source") == "comparison",
+          f"status={r10.status_code} body={r10.text[:200]}")
+
+    # 12. compare: a broken reference file is attributed to "reference"
+    broken_reference = HEADER.format(ts="1ns") + "#0\n0!\n#10\nwhatisthis\n"
+    r11 = post_compare(broken_reference, candidate_ps, pair_clk)
+    err11 = r11.json().get("error", {}) if r11.content else {}
+    check("compare: malformed reference attributed to reference",
+          r11.status_code == 422 and err11.get("code") == "VCD_SYNTAX_ERROR"
+          and err11.get("source") == "reference",
+          f"status={r11.status_code} body={r11.text[:200]}")
 
     if failures:
         print(f"\n{len(failures)} smoke check(s) failed: {failures}")

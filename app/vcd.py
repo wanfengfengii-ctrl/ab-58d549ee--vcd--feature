@@ -14,6 +14,7 @@ ever produced.
 
 from __future__ import annotations
 
+import bisect
 import json
 import re
 from dataclasses import dataclass, field
@@ -23,7 +24,14 @@ from typing import Optional
 
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_VALUE_CHANGES = 50_000
+MAX_PAIRS = 64
 MAX_FS = 2**63 - 1
+
+# Which uploaded side of a comparison an error belongs to. "comparison"
+# marks request-level problems (window, pairs, combined limits).
+SOURCE_REFERENCE = "reference"
+SOURCE_CANDIDATE = "candidate"
+SOURCE_COMPARISON = "comparison"
 
 SCOPE_KINDS = {"module", "begin", "fork", "function", "task"}
 DUMP_KEYWORDS = {
@@ -57,6 +65,7 @@ class VCDError(Exception):
         line: Optional[int] = None,
         details: Optional[dict] = None,
         http_status: int = 422,
+        source: str = SOURCE_COMPARISON,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -64,6 +73,9 @@ class VCDError(Exception):
         self.line = line
         self.details = details
         self.http_status = http_status
+        # Only the compare endpoint surfaces this; POST /api/vcd/window
+        # keeps its historical error body unchanged.
+        self.source = source
 
     def to_response(self) -> tuple[dict, int]:
         err: dict = {"code": self.code, "message": self.message}
@@ -74,8 +86,13 @@ class VCDError(Exception):
         return {"error": err}, self.http_status
 
 
-def bad_request(code: str, message: str, details: Optional[dict] = None) -> VCDError:
-    return VCDError(code, message, details=details, http_status=400)
+def bad_request(
+    code: str,
+    message: str,
+    details: Optional[dict] = None,
+    source: str = SOURCE_COMPARISON,
+) -> VCDError:
+    return VCDError(code, message, details=details, http_status=400, source=source)
 
 
 # --- parsed model ---------------------------------------------------------
@@ -147,7 +164,7 @@ def _tokenize(text: str) -> list[tuple[str, int]]:
 # --- parser ---------------------------------------------------------------
 
 
-def parse(text: str) -> VCD:
+def parse(text: str, max_changes: int = MAX_VALUE_CHANGES) -> VCD:
     tokens = _tokenize(text)
     vcd = VCD(timescale_fs=0, names={})
     id_kind: dict[str, tuple[str, str]] = {}
@@ -435,10 +452,10 @@ def parse(text: str) -> VCD:
             )
 
         change_count += 1
-        if change_count > MAX_VALUE_CHANGES:
+        if change_count > max_changes:
             raise VCDError(
                 "TOO_MANY_CHANGES",
-                f"more than {MAX_VALUE_CHANGES} value changes in one request",
+                f"more than {max_changes} value changes in one request",
                 line=line,
             )
 
@@ -646,4 +663,247 @@ def process(text: str, signals: list[str], window: Window) -> dict:
     return {
         "window": {"start": window.start, "end": window.end, "unit": "fs"},
         "signals": result_signals,
+    }
+
+
+# --- golden vs candidate comparison ---------------------------------------
+
+
+@dataclass
+class SignalPair:
+    reference: str
+    candidate: str
+
+
+def parse_pairs(raw_list: list[str]) -> list[SignalPair]:
+    """Parse one to sixty-four uniquely numbered signal pairs.
+
+    Accepted encodings (both mirror the existing ``signals`` flexibility):
+
+    * repeated form fields, each a JSON object
+      ``{"reference": "top.a", "candidate": "top.b"}``
+    * a single form field carrying a JSON array of such objects
+    """
+    if not raw_list:
+        raise bad_request("MISSING_FIELD", "at least one 'pair' field is required")
+
+    if len(raw_list) == 1 and raw_list[0].lstrip().startswith("["):
+        try:
+            parsed = json.loads(raw_list[0])
+        except json.JSONDecodeError as exc:
+            raise bad_request(
+                "INVALID_JSON", f"'pair' must be JSON: {exc.msg}"
+            ) from exc
+        if not isinstance(parsed, list):
+            raise bad_request(
+                "INVALID_PAIR", "'pair' must be a JSON array of objects"
+            )
+        items = parsed
+    else:
+        items = []
+        for raw in raw_list:
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise bad_request(
+                    "INVALID_JSON", f"'pair' entries must be JSON: {exc.msg}"
+                ) from exc
+            items.append(obj)
+
+    if not items:
+        raise bad_request("INVALID_PAIR", "at least one signal pair is required")
+    if len(items) > MAX_PAIRS:
+        raise bad_request(
+            "TOO_MANY_PAIRS",
+            f"at most {MAX_PAIRS} signal pairs are accepted",
+            details={"count": len(items), "max": MAX_PAIRS},
+        )
+
+    pairs: list[SignalPair] = []
+    seen_keys: set[tuple[str, str]] = set()
+    duplicate_keys: list[dict] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise bad_request(
+                "INVALID_PAIR",
+                f"pair #{index} must be a JSON object",
+                details={"index": index},
+            )
+        ref, cand = item.get("reference"), item.get("candidate")
+        if not isinstance(ref, str) or not isinstance(cand, str) or not ref or not cand:
+            raise bad_request(
+                "INVALID_PAIR",
+                f"pair #{index} must carry non-empty 'reference' and "
+                "'candidate' signal names",
+                details={"index": index},
+            )
+        key = (ref, cand)
+        if key in seen_keys:
+            duplicate_keys.append({"reference": ref, "candidate": cand})
+        seen_keys.add(key)
+        pairs.append(SignalPair(reference=ref, candidate=cand))
+
+    if duplicate_keys:
+        raise bad_request(
+            "DUPLICATE_PAIR",
+            "duplicate signal pairs in the request",
+            details={"duplicates": duplicate_keys},
+        )
+    return pairs
+
+
+def _check_window_covered(vcd: VCD, window: Window, source: str) -> None:
+    assert vcd.first_ts is not None and vcd.last_ts is not None
+    if window.start < vcd.first_ts or window.end > vcd.last_ts:
+        raise VCDError(
+            "WINDOW_NOT_COVERED",
+            "window cannot be fully interpreted from the waveform: the VCD "
+            "must contain a timestamp at or before window start and at or "
+            "after window end",
+            details={
+                "window_start_fs": window.start,
+                "window_end_fs": window.end,
+                "first_timestamp_fs": vcd.first_ts,
+                "last_timestamp_fs": vcd.last_ts,
+            },
+            source=source,
+        )
+
+
+def _check_signals_declared(vcd: VCD, names: list[str], source: str) -> None:
+    missing = [name for name in names if name not in vcd.names]
+    if missing:
+        raise VCDError(
+            "UNDECLARED_SIGNAL",
+            "selected signal is not declared in the VCD",
+            details={"signals": missing},
+            http_status=400,
+            source=source,
+        )
+
+
+def compare(
+    reference_text: str,
+    candidate_text: str,
+    pairs: list[SignalPair],
+    window: Window,
+) -> dict:
+    """Compare golden and candidate windows. All-or-nothing result.
+
+    Both traces are normalized to femtoseconds via their own timescales, so
+    logically identical waveforms expressed at different timescales compare
+    equal. Any failure is attributed to ``reference``, ``candidate`` or
+    ``comparison`` and aborts the whole request.
+    """
+    # Parse both before reporting anything: no partial results are produced.
+    def parse_side(text: str, source: str) -> VCD:
+        try:
+            # Each file keeps its existing per-file 50k cap.
+            return parse(text, max_changes=MAX_VALUE_CHANGES)
+        except VCDError as exc:
+            exc.source = source
+            raise
+
+    ref = parse_side(reference_text, SOURCE_REFERENCE)
+    cand = parse_side(candidate_text, SOURCE_CANDIDATE)
+
+    # The request as a whole may carry at most 50k value changes across both
+    # files; this is a comparison-level constraint.
+    ref_change_count = sum(len(events) for events in ref.changes.values())
+    cand_change_count = sum(len(events) for events in cand.changes.values())
+    if ref_change_count + cand_change_count > MAX_VALUE_CHANGES:
+        raise VCDError(
+            "TOO_MANY_CHANGES",
+            f"more than {MAX_VALUE_CHANGES} value changes across reference "
+            "and candidate in one request",
+            details={
+                "reference_changes": ref_change_count,
+                "candidate_changes": cand_change_count,
+                "total": ref_change_count + cand_change_count,
+                "max": MAX_VALUE_CHANGES,
+            },
+            source=SOURCE_COMPARISON,
+        )
+
+    _check_signals_declared(ref, [p.reference for p in pairs], SOURCE_REFERENCE)
+    _check_signals_declared(cand, [p.candidate for p in pairs], SOURCE_CANDIDATE)
+    _check_window_covered(ref, window, SOURCE_REFERENCE)
+    _check_window_covered(cand, window, SOURCE_CANDIDATE)
+
+    start, end = window.start, window.end
+
+    def level_at(
+        events: list[tuple[int, str]], times: list[int], when_fs: int
+    ) -> str:
+        """Last change at or before *when_fs* in text order, else x."""
+        idx = bisect.bisect_right(times, when_fs) - 1
+        return events[idx][1] if idx >= 0 else "x"
+
+    results = []
+    total_mismatch_fs = 0
+    for pair in pairs:
+        ref_events = ref.changes.get(ref.names[pair.reference], [])
+        cand_events = cand.changes.get(cand.names[pair.candidate], [])
+        ref_times = [t for t, _ in ref_events]
+        cand_times = [t for t, _ in cand_events]
+
+        ref_level = level_at(ref_events, ref_times, start)
+        cand_level = level_at(cand_events, cand_times, start)
+
+        # Merge the two interior boundary streams (strictly inside the
+        # window, deduplicated) into one sorted sequence.
+        boundaries = sorted(
+            {t for t in ref_times if start < t < end}
+            | {t for t in cand_times if start < t < end}
+        )
+
+        raw: list[tuple[int, int, str, str]] = []
+        seg_start = start
+        for boundary in boundaries:
+            if ref_level != cand_level:
+                raw.append((seg_start, boundary, ref_level, cand_level))
+            # Recompute both levels at the boundary: bisect_right on each
+            # stream preserves same-timestamp text-order arbitration.
+            ref_level = level_at(ref_events, ref_times, boundary)
+            cand_level = level_at(cand_events, cand_times, boundary)
+            seg_start = boundary
+        if ref_level != cand_level:
+            raw.append((seg_start, end, ref_level, cand_level))
+
+        # Merge adjacent mismatching intervals of the same level pair.
+        merged: list[dict] = []
+        mismatch_fs = 0
+        for seg_start_fs, seg_end_fs, rv, cv in raw:
+            mismatch_fs += seg_end_fs - seg_start_fs
+            if (
+                merged
+                and merged[-1]["end"] == seg_start_fs
+                and merged[-1]["referenceValue"] == rv
+                and merged[-1]["candidateValue"] == cv
+            ):
+                merged[-1]["end"] = seg_end_fs
+            else:
+                merged.append(
+                    {
+                        "start": seg_start_fs,
+                        "end": seg_end_fs,
+                        "referenceValue": rv,
+                        "candidateValue": cv,
+                    }
+                )
+
+        total_mismatch_fs += mismatch_fs
+        results.append(
+            {
+                "reference": pair.reference,
+                "candidate": pair.candidate,
+                "differences": merged,
+                "mismatchFs": mismatch_fs,
+            }
+        )
+
+    return {
+        "window": {"start": start, "end": end, "unit": "fs"},
+        "pairs": results,
+        "mismatchFs": total_mismatch_fs,
     }
